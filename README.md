@@ -11,7 +11,7 @@ Old pods talk to the old logical schema, new pods talk to the new one, and the d
 
 Typically implemented with **versioned views** backed by the same underlying tables, each exposing the data shape the corresponding application version expects
 
-A pod selects its logical schema once at connection time (e.g. via `search_path`) and is unaffected from the rollout from then on
+A pod selects its logical schema once at connection time (e.g. via `search_path`) and is unaffected by the rollout from then on
 
 ## The Three Phases
 
@@ -48,165 +48,311 @@ Once every running instance has moved to the new version, the old structure is r
 - Drop the obsolete columns or tables
 - Drop the old logical schema (the old view)
 
-After Contract, only the new shape remains. The transition is completea
+After Contract, only the new shape remains
+
+The transition is complete
 
 # Migrations Guideline
 
+## Pre-Deploy vs Post-Deploy
+
+Migrations split into two phases around the application rollout:
+
+- **Pre-deploy** runs before the new application version is deployed; use it for additive, backward-compatible changes
+- **Post-deploy** runs after every instance has moved to the new version; use it for destructive or restrictive changes
+
 ## Locking
 
-DDL that takes `ACCESS EXCLUSIVE` is "fast" in isolation but can stall the database if it queues behind a long-running query:
-while the migration waits, every subsequent reader queues _behind_ it
+DDL that takes `ACCESS EXCLUSIVE` is "fast" in isolation but can stall the database if it queues behind a long-running query: while the migration waits, every subsequent reader queues _behind_ it
 
 Two defenses, applied to every DDL session:
 
-1. Query [`pg_locks`][pg_locks] for long-running blockers on the target table; pause and retry until the queue is short
+1. Query [`pg_locks`](https://www.postgresql.org/docs/18/view-pg-locks.html) for long-running blockers on the target table; pause and retry until the queue is short
 2. Bound the wait with `lock_timeout`:
 
-    ```sql
-    BEGIN;
-    SET LOCAL lock_timeout = '2s';   -- fail if not acquired in 2 s
-    ALTER TABLE t ADD COLUMN c text;
-    COMMIT;
-    ```
+   ```sql
+   BEGIN;
+   SET LOCAL lock_timeout = '2s';   -- fail if not acquired in 2s
+   ALTER TABLE t ADD COLUMN c text;
+   COMMIT;
+   ```
 
-Operations that take a _weaker_ lock — `CREATE INDEX CONCURRENTLY`, `ALTER TABLE … VALIDATE CONSTRAINT` — wait without blocking writers and don't need this protection
+Operations that take a _weaker_ lock — `CREATE INDEX CONCURRENTLY`, `ALTER TABLE … VALIDATE CONSTRAINT` — don't block concurrent reads or writes, so they don't need this protection
 
-[pg_locks]: https://www.postgresql.org/docs/18/view-pg-locks.html
+They can still wait a long time for in-flight transactions on the table to drain, but that wait is invisible to other clients
 
-## Tables
+## Migrations and Transactions
+
+Some migrations must run outside a transaction:
+
+- `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY`
+- Batched data migrations (backfills)
+
+## Table Operations
 
 ### Create a Table
 
-Single migration. [`CREATE TABLE`][create_table] does not lock existing tables.
-If the table has multiple foreign keys, split them across migrations:
-each `ADD FOREIGN KEY` locks the referenced table, and holding several locks at once raises deadlock risk
+[`CREATE TABLE`](https://www.postgresql.org/docs/18/sql-createtable.html) does not lock existing tables
 
-1. Create the table with indexes, no foreign keys
-2. Add the first foreign key (`NOT VALID` + `VALIDATE`)
-3. Add the next foreign key
-
-[create_table]: https://www.postgresql.org/docs/18/sql-createtable.html
+For FKs, follow [Add a `FOREIGN KEY`](#add-a-foreign-key)
 
 ### Rename a Table
 
-Two deployments. [`ALTER TABLE … RENAME`][alter_table] takes `ACCESS EXCLUSIVE` very briefly, but client code holding the old name
-keeps using it until the rolling deploy completes
+[`ALTER TABLE … RENAME`](https://www.postgresql.org/docs/18/sql-altertable.html) takes a short `ACCESS EXCLUSIVE`
 
-1. **Deploy N**: rename the table and create a view under the old name in the same transaction.
-   Reads, inserts, updates, and deletes against the view continue to work — see the [updatable views caveats][updatable_views]
+1. Rename the table and create a view under the old name:
 
-    ```sql
-    BEGIN;
-    ALTER TABLE t_old RENAME TO t_new;
-    CREATE VIEW t_old AS SELECT * FROM t_new;
-    COMMIT;
-    ```
+   Reads, inserts, updates, and deletes against the view continue to work — see the [updatable views caveats](https://www.postgresql.org/docs/18/sql-createview.html#SQL-CREATEVIEW-UPDATABLE-VIEWS)
 
-2. **Deploy N+1** (post-deploy): drop the view once every client is on the new name
+   ```sql
+   BEGIN;
+   ALTER TABLE t_old RENAME TO t_new;
+   CREATE VIEW t_old AS SELECT * FROM t_new;
+   COMMIT;
+   ```
+2. Deploy a code change to start using the new table
+3. Drop the temporary view:
 
-    ```sql
-    DROP VIEW t_old;
-    ```
+   ```sql
+   DROP VIEW t_old;
+   ```
 
-[alter_table]: https://www.postgresql.org/docs/18/sql-altertable.html
-[updatable_views]: https://www.postgresql.org/docs/18/sql-createview.html#SQL-CREATEVIEW-UPDATABLE-VIEWS
+Sanity-check via [`pg_stat_user_tables`](https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-PG-STAT-USER-TABLES-VIEW) that the view is no longer being read before dropping it
 
 ### Drop a Table
 
-Two deployments. `DROP TABLE` takes `ACCESS EXCLUSIVE`
+`DROP TABLE` takes `ACCESS EXCLUSIVE`
 
-1. **Deploy N**: remove every reference to the table from the code
-2. **Deploy N+1** (post-deploy): `DROP TABLE t;`
+If another table has a FK pointing to this one, drop those FKs first in separate migrations (one FK per migration); otherwise `DROP TABLE` fails
 
-Sanity-check via [`pg_stat_user_tables`][pg_stat_user_tables] that the table is no longer being read before scheduling Deploy N+1
+Avoid `DROP TABLE … CASCADE` — it acquires `ACCESS EXCLUSIVE` on every dependent table in a single transaction, increasing the chance of deadlocks
 
-[pg_stat_user_tables]: https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-PG-STAT-USER-TABLES-VIEW
+1. Deploy a code change to stop using the table
+2. Drop the now unused table:
+
+   ```sql
+   DROP TABLE t;
+   ```
+
+Sanity-check via `pg_stat_user_tables` that the table is no longer being read before running the post-deploy migration
 
 ## Columns
 
 ### Add a Column
 
-Single migration. `ALTER TABLE … ADD COLUMN` takes a brief metadata-only `ACCESS EXCLUSIVE` lock.
-PostgreSQL stores defaults in the catalog, so adding a column with a constant default does not rewrite the table
+`ALTER TABLE … ADD COLUMN` takes `ACCESS EXCLUSIVE`; the duration depends on whether the table needs a rewrite
 
-- **Nullable, no default** -> direct
-- **With a constant default** -> direct (no rewrite)
-- **`NOT NULL` with no default** -> not safe in one step. Either add a default, or add the column nullable and follow [Add NOT NULL](#add-not-null)
+#### Without a Rewrite
+
+No rewrite is required when the new column is one of:
+
+- No `DEFAULT` specified (the column defaults to `NULL`)
+- A non-volatile `DEFAULT` (e.g., a constant or a non-volatile expression)
+- A virtual generated column
+
+For a non-volatile `DEFAULT`, the value is evaluated once at statement time and stored in the table's metadata; existing rows return the default on access without being rewritten
+
+```sql
+ALTER TABLE t ADD COLUMN c text;                                      -- defaults to NULL
+ALTER TABLE t ADD COLUMN c text DEFAULT 'foo';                        -- non-volatile DEFAULT
+ALTER TABLE t ADD COLUMN c int GENERATED ALWAYS AS (a + b) VIRTUAL;   -- virtual generated
+```
+
+#### With a Rewrite
+
+The entire table and its indexes are rewritten under `ACCESS EXCLUSIVE` when the new column has any of:
+
+- A volatile `DEFAULT` (e.g., `clock_timestamp()`, `random()`, `nextval()`)
+- `GENERATED ALWAYS AS (…) STORED`
+- `GENERATED … AS IDENTITY`
+- A domain data type that has constraints
+
+For a volatile `DEFAULT`, skip the rewrite by adding the column nullable first, backfilling, and then attaching the default for future inserts:
+
+1. Add the column as nullable with no `DEFAULT`
+2. Backfill the desired values in batches, outside any transaction
+3. Set the original `DEFAULT` for future inserts:
+
+   Applies only to subsequent `INSERT` and `UPDATE` statements and does not change rows already in the table, regardless of the expression's volatility
+
+   ```sql
+   ALTER TABLE t ALTER COLUMN c SET DEFAULT …;
+   ```
+4. If the column needs to be `NOT NULL`, follow [Add `NOT NULL` constraint](#add-a-check-or-not-null-constraint)
 
 ### Drop a Column
 
-Two deployments. `DROP COLUMN` takes `ACCESS EXCLUSIVE`
+`DROP COLUMN` takes a short `ACCESS EXCLUSIVE` while the column is marked dropped in the catalog
 
-1. **Deploy N**: remove every reference to the column from the code.
-   The column stays in the database until every old service instance is gone — old binaries still issue queries that mention it
-2. **Deploy N+1**:
-    1. Find dependents in [`pg_depend`][pg_depend] catalog
-    2. Drop dependent indexes with `DROP INDEX CONCURRENTLY` first; otherwise they would be dropped along with the column under `ACCESS EXCLUSIVE`
-    3. If a view references the column, recreate the view without it
-    4. `ALTER TABLE t DROP COLUMN c;`
+1. Deploy a code change to stop using the column
+2. Drop the now unused column:
+   1. Find dependents in the [`pg_depend`](https://www.postgresql.org/docs/18/catalog-pg-depend.html) catalog
+   2. Drop dependent indexes with `DROP INDEX CONCURRENTLY` first; otherwise they would be dropped along with the column under `ACCESS EXCLUSIVE`
+   3. If a view references the column, recreate the view without it
+   4. Drop the column:
 
-Sanity-check via `pg_stat_user_tables` that the column is no longer being read before scheduling Deploy N+1
+      ```sql
+      ALTER TABLE t DROP COLUMN c;
+      ```
 
-[pg_depend]: https://www.postgresql.org/docs/18/catalog-pg-depend.html
+Sanity-check via `pg_stat_user_tables` that the column is no longer being read before running the post-deploy migration
 
 ### Rename a Column
 
-Two deployments + backfill. Both names must coexist while the rolling
-deploy is in progress, because old code still uses the old name and new code uses the new one
+Both names must coexist while the deploy is in progress, because old code still uses the old name and new code uses the new one
 
-1. **Expand (Deploy N)**:
-    1. Add the new column
-    2. Dual-write to both columns via a `BEFORE INSERT/UPDATE` trigger (or in application code)
-2. **Backfill**: Copy existing data from old column to new column in batches. Verify completion
-3. **Contract (Deploy N+1)**:
-    1. Switch the app to read/write the new column
-    2. Drop the trigger and the old column in a post-deploy migration
-
-If a view references the column, recreate it pointing at the new column during Expand phase
+1. Create a new temporary column with a target name:
+   1. Add the new column
+   2. Dual-write to both columns via a `BEFORE INSERT/UPDATE` trigger (or in application code)
+   3. [Build indexes](#create-an-index) that referenced the old column on the new column
+   4. [Recreate any FKs](#add-a-foreign-key) that referenced the old column on the new column
+   5. If a view references the old column, recreate it pointing at the new column
+   6. Backfill existing data from the old column to the new column in batches, outside any transaction
+2. Deploy a code change to stop using the old column
+3. Drop the trigger and the now unused old column
 
 ### Change a Column's Type
 
-One migration if the change is catalog-only; two deployments plus a backfill otherwise.
-Either way `ALTER COLUMN … TYPE` takes `ACCESS EXCLUSIVE`, but a rewrite holds it for the full scan
+#### Without a Rewrite
 
-Verify if changes are catalog-only on a thin-clone by checking that [`pg_class.relfilenode`][pg_class] doesn't change
+If the change is catalog-only, it is a single migration with a short `ACCESS EXCLUSIVE`, without a table rewrite
 
-For changes that rewrite the column:
+Verify that [`pg_class.relfilenode`](https://www.postgresql.org/docs/18/catalog-pg-class.html) doesn't change before treating it as catalog-only
 
-1. Add a new column of the target type
-2. Dual-write to both columns via a `BEFORE INSERT/UPDATE` trigger (or in application code)
-3. Backfill the new column in batches. Validate the cast on a clone first — a failed cast mid-backfill leaves the column half-migrated
-4. Swap names in a single transaction with a short [`LOCK TABLE`][lock_table]
-5. Drop the old column in a post-deploy migration
+```sql
+ALTER TABLE t ALTER COLUMN c TYPE text;
+```
 
-[pg_class]: https://www.postgresql.org/docs/18/catalog-pg-class.html
-[lock_table]: https://www.postgresql.org/docs/18/sql-lock.html
+Indexes on the column may still be rebuilt under the same `ACCESS EXCLUSIVE` unless PostgreSQL can prove the new index is logically equivalent to the old one (e.g. collation unchanged); check that each index's `relfilenode` is unchanged to confirm
 
-### Add `NOT NULL`
+#### With a Rewrite
 
-Two deployments. PostgreSQL 18 supports a [native `NOT NULL … NOT VALID` constraint][pg18_release], which avoids
-the long table scan that the pre-18 `SET NOT NULL` form required
+For changes that rewrite the column, the approach is almost identical to [renaming a column](#rename-a-column)
 
-The flow is:
+Validate the cast on a clone first — a failed cast mid-backfill leaves the column half-migrated
 
-1. **Deploy N**:
-    1. Update code so it never writes `NULL` to the column
-    2. Backfill `NULL` rows in batches in a post-deploy data migration
-2. **Deploy N+1**: register and validate the constraint without a long exclusive lock:
+1. Create a new temporary column with a target type:
+   1. Add a new column of the target type
+   2. Dual-write to both columns via a `BEFORE INSERT/UPDATE` trigger (or in application code), casting in both directions
+   3. [Build indexes](#create-an-index) that referenced the old column on the new column
+   4. [Recreate any FKs](#add-a-foreign-key) that referenced the old column on the new column
+   5. If a view references the old column, recreate it pointing at the new column
+   6. Backfill existing data with the cast, in batches, outside any transaction
+2. Deploy a code change to stop using the old column
+3. Drop the trigger and the now unused old column
 
-    ```sql
-    ALTER TABLE t ADD CONSTRAINT t_c_not_null NOT NULL c NOT VALID; -- Brief ACCESS EXCLUSIVE: catalog-only, no scan
-    ALTER TABLE t VALIDATE CONSTRAINT t_c_not_null;  -- SHARE UPDATE EXCLUSIVE: scans existing rows; reads and writes continue concurrently
-    ```
+## Indexes
 
-After `VALIDATE` the column behaves as if it were declared `NOT NULL` at column level — the optimizer treats it the same.
-There is no need for a follow-up `SET NOT NULL` step on PG 18
+### Create an Index
 
-[pg18_release]: https://www.postgresql.org/docs/18/release-18.html
+[`CREATE INDEX CONCURRENTLY`](https://www.postgresql.org/docs/18/sql-createindex.html) takes `SHARE UPDATE EXCLUSIVE`
 
-### Drop `NOT NULL`
+It cannot run inside a transaction (see [Migrations and Transactions](#migrations-and-transactions)) and requires two table scans
 
-Single migration. Brief metadata-only `ACCESS EXCLUSIVE`, no rewrite
+It also waits for in-flight transactions on the table to complete before finishing — it can stall behind a long query, but that wait does not block any other client
+
+```sql
+CREATE INDEX CONCURRENTLY t_idx ON t (c);
+```
+
+If the build fails, the database leaves an `INVALID` index — drop it before retrying:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS t_idx;
+```
+
+### Drop an Index
+
+`DROP INDEX CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE`
+
+```sql
+DROP INDEX CONCURRENTLY t_idx;
+```
+
+Cannot drop an index backing a `PRIMARY KEY` or `UNIQUE` constraint — drop the constraint instead, which removes the index
+
+### Reindex an Index
+
+Same `SHARE UPDATE EXCLUSIVE` lock and caveats as for [`CREATE INDEX CONCURRENTLY`](#create-an-index)
+
+```sql
+REINDEX INDEX CONCURRENTLY t_idx;
+```
+
+## Constraints
+
+### Add a `CHECK` or `NOT NULL` Constraint
+
+[`ADD … NOT VALID`](https://www.postgresql.org/docs/18/sql-altertable.html) registers the constraint under a short `ACCESS EXCLUSIVE` without scanning existing rows
+
+[`VALIDATE CONSTRAINT`](https://www.postgresql.org/docs/18/sql-altertable.html) scans them later under `SHARE UPDATE EXCLUSIVE`
+
+New rows are checked from the moment the constraint is added
+
+`ADD … NOT VALID` and `VALIDATE CONSTRAINT` must run in separate transactions — otherwise the validation scan inherits the `ACCESS EXCLUSIVE` held since `NOT VALID`, blocking the table for the full scan
+
+PostgreSQL 18 supports the same `ADD … NOT VALID` / `VALIDATE CONSTRAINT` pattern for `NOT NULL`, replacing the pre-18 `SET NOT NULL` form that required a table scan
+
+1. Deploy a code change to stop writing rows that would violate the constraint
+2. Register the not-valid constraint:
+
+   ```sql
+   -- CHECK
+   ALTER TABLE t ADD CONSTRAINT t_c CHECK (c > 0) NOT VALID;
+   
+   -- NOT NULL (PG 18+)
+   ALTER TABLE t ADD CONSTRAINT t_c NOT NULL c NOT VALID;
+   ```
+3. Fix existing violating rows in batches, outside any transaction
+4. Validate the constraint on existing rows:
+
+   ```sql
+   ALTER TABLE t VALIDATE CONSTRAINT t_c;
+   ```
+
+After `VALIDATE` for `NOT NULL`, the column behaves as if declared `NOT NULL` at column level — the optimizer treats it the same, and no follow-up `SET NOT NULL` step is needed
+
+For partitioned tables, validate each partition first, then attach to the parent
+
+### Add a `FOREIGN KEY` Constraint
+
+[`ADD FOREIGN KEY … NOT VALID`](https://www.postgresql.org/docs/18/sql-altertable.html) takes `SHARE ROW EXCLUSIVE` on both the referencing and referenced tables for the catalog update
+
+[`VALIDATE CONSTRAINT`](https://www.postgresql.org/docs/18/sql-altertable.html) takes `SHARE UPDATE EXCLUSIVE` on the referencing table and `ROW SHARE` on the referenced table
+
+New rows are checked from the moment the constraint is added
+
+Two rules follow from the lock profile:
+
+- One FK per transaction — acquiring `SHARE ROW EXCLUSIVE` on two tables in one transaction can cause a deadlock
+- `ADD … NOT VALID` and `VALIDATE CONSTRAINT` must run in separate transactions — otherwise the validation scan inherits the `SHARE ROW EXCLUSIVE` held since `NOT VALID`, blocking writes on both tables for the full scan
+
+1. Deploy a code change to stop writing rows that would violate the FK (e.g. orphan rows)
+2. Register the FK without validation:
+
+   ```sql
+   ALTER TABLE t1 ADD CONSTRAINT t1_c_fk FOREIGN KEY (c) REFERENCES t2 (id) NOT VALID;
+   ```
+3. Clean up violating rows in batches, outside any transaction
+4. Validate the existing rows:
+
+   ```sql
+   ALTER TABLE t1 VALIDATE CONSTRAINT t1_c_fk;
+   ```
+
+For partitioned tables, validate each partition first, then attach to the parent
+
+### Drop a `NOT NULL` Constraint
+
+Takes a short `ACCESS EXCLUSIVE`, without a table rewrite
+
+If the constraint was added as a named table constraint, drop it by name:
+
+```sql
+ALTER TABLE t DROP CONSTRAINT t_c;
+```
+
+Or via the column-level form, which works regardless of how the constraint was added:
 
 ```sql
 ALTER TABLE t ALTER COLUMN c DROP NOT NULL;
@@ -214,94 +360,35 @@ ALTER TABLE t ALTER COLUMN c DROP NOT NULL;
 
 For partitioned tables, drop on the parent — partitions inherit it
 
-## Indexes
-
-### Create an Index
-
-Single migration. [`CREATE INDEX CONCURRENTLY`][create_index] takes `SHARE UPDATE EXCLUSIVE` and does not block reads or writes
-
-It cannot run inside a transaction and requires two table scans, so it's slower than a plain `CREATE INDEX`.
-It also waits for in-flight transactions on the table to complete before finishing — it can stall behind a long query
-
-```sql
-CREATE INDEX CONCURRENTLY t_c_idx ON t (c);
-```
-
-If the build fails, the database leaves an `INVALID` index. Drop it before retrying:
-
-```sql
-DROP INDEX CONCURRENTLY IF EXISTS t_c_idx;
-```
-
-[create_index]: https://www.postgresql.org/docs/18/sql-createindex.html
-
-### Drop an Index
-
-Single migration. `DROP INDEX CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE`.
-
-```sql
-DROP INDEX CONCURRENTLY t_c_idx;
-```
-
-Cannot drop an index backing a `PRIMARY KEY` or `UNIQUE` constraint — drop the constraint instead, which removes the index
-
-### Reindex an Index
-
-Single migration. Same `SHARE UPDATE EXCLUSIVE` lock and caveats as `CREATE INDEX CONCURRENTLY`
-
-```sql
-REINDEX INDEX CONCURRENTLY t_c_idx;
-```
-
-## Constraints
-
-### Add a Foreign-Key or `CHECK` Constraint
-
-Single migration, two-step.
-[`NOT VALID`][not_valid] registers the constraint without scanning existing rows under a brief `ACCESS EXCLUSIVE` (or `SHARE ROW EXCLUSIVE` on both sides for foreign keys);
-[`VALIDATE CONSTRAINT`][validate] scans them later under `SHARE UPDATE EXCLUSIVE`, allowing concurrent reads and writes (plus `ROW SHARE` on the referenced table for foreign keys).
-New rows are checked from the moment the constraint is added
-
-```sql
--- Foreign key (t1.c -> t2.id)
-ALTER TABLE t1 ADD CONSTRAINT t1_c_fk FOREIGN KEY (c) REFERENCES t2 (id) NOT VALID;
-ALTER TABLE t1 VALIDATE CONSTRAINT t1_c_fk;
-
--- CHECK
-ALTER TABLE t ADD CONSTRAINT t_c_check CHECK (c > 0) NOT VALID;
-ALTER TABLE t VALIDATE CONSTRAINT t_c_check;
-```
-
-For partitioned tables, validate each partition first, then attach to the parent
-
-(`NOT NULL` follows the same pattern but is documented separately under [Columns -> Add NOT NULL](#add-not-null) for the deployment context)
-
-[not_valid]: https://www.postgresql.org/docs/18/sql-altertable.html
-[validate]: https://www.postgresql.org/docs/18/sql-altertable.html
-
 ### Add a `UNIQUE` Constraint
 
-Single migration, two-step. The plain form `ADD CONSTRAINT … UNIQUE (col)` builds the backing index under `ACCESS EXCLUSIVE`.
-Build the index concurrently first (`SHARE UPDATE EXCLUSIVE`), then attach it to the constraint with a brief metadata-only `ACCESS EXCLUSIVE`:
+1. Create a new index:
 
-```sql
-CREATE UNIQUE INDEX CONCURRENTLY t_c_uniq ON t (c);
-ALTER TABLE t ADD CONSTRAINT t_c_uniq UNIQUE USING INDEX t_c_uniq;
-```
+   Takes `SHARE UPDATE EXCLUSIVE`
 
-The `ADD CONSTRAINT` step is a fast metadata-only operation
+   ```sql
+   CREATE UNIQUE INDEX CONCURRENTLY t_c_uniq ON t (c);
+   ```
+
+   Note that `CREATE UNIQUE INDEX CONCURRENTLY` fails if any duplicates exist at build time, leaving an `INVALID` index behind
+2. Deploy a code change that rejects any new duplicate writes
+3. Convert an index to the constraint:
+
+   Takes a short `ACCESS EXCLUSIVE`
+
+   ```sql
+   ALTER TABLE t ADD CONSTRAINT t_c_uniq UNIQUE USING INDEX t_c_uniq;
+   ```
 
 ## Enum Types
 
 ### Add or Rename a Value
 
-Single migration. [`ALTER TYPE`][alter_type] does not lock tables that reference the enum:
+[`ALTER TYPE`](https://www.postgresql.org/docs/18/sql-altertype.html) does not lock tables that reference the enum:
 
 ```sql
 ALTER TYPE my_enum ADD VALUE 'x';
 ALTER TYPE my_enum RENAME VALUE 'a' TO 'b';
 ```
 
-`ADD VALUE` cannot run in the same transaction that later references the new value
-
-[alter_type]: https://www.postgresql.org/docs/18/sql-altertype.html
+Note that `ADD VALUE` cannot run in the same transaction that later references the new value
