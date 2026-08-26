@@ -392,3 +392,33 @@ ALTER TYPE my_enum RENAME VALUE 'a' TO 'b';
 ```
 
 Note that `ADD VALUE` cannot run in the same transaction that later references the new value
+
+# Backfills
+
+A backfill loops a batched write until every row is done. They run between the expand MR's deploy and the contract MR.
+
+```sql
+with batch as (
+   select <pk_cols> 
+   from <schema>.<table>
+   where (<pk_cols>) > ($1, $2, ...) -- Tuple comparison. Omitted for the first batch.
+   order by <pk_cols> asc
+   limit $3
+   for no key update
+),
+updated as (
+   update <schema>.<table> t 
+   set <column> = <expression>
+   from batch
+   where (t.<pk_cols>) = (batch.<pk_cols>) and t.<column> is null
+)
+select <pk_cols>
+from batch
+order by <pk_cols> desc
+limit 1;
+```
+
+> [!NOTE]
+> A simpler pattern without a cursor slows down backfills over time.
+>
+> See [Postgres Job Queues & Failure By MVCC](https://brandur.org/postgres-queues) and [LIMIT-only loop-based batching strategy](https://gitlab.com/gitlab-org/gitlab/-/work_items/544662).
